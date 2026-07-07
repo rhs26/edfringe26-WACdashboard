@@ -126,6 +126,8 @@
   .summary-card{background:var(--card-2);border-radius:8px;padding:12px 10px;text-align:center;}
   .summary-card .label{font-size:10.5px;color:var(--ink-faint);text-transform:uppercase;letter-spacing:0.05em;}
   .summary-card .value{font-size:22px;font-weight:700;color:var(--ink);margin-top:4px;font-variant-numeric:tabular-nums;}
+  .summary-card .value-row{display:flex;align-items:baseline;justify-content:center;gap:8px;margin-top:4px;}
+  .summary-card .value-row .value{margin-top:0;}
 
   /* heatmap */
   .scale-toggle{display:flex;gap:4px;font-size:11px;}
@@ -144,7 +146,9 @@
   .cal-cell.has-perf{cursor:pointer;}
   .cal-cell .d{font-size:10.5px;font-weight:700;}
   .cal-cell .p{font-size:10px;margin-top:1px;}
-  .cal-dot{position:absolute;top:3px;right:3px;width:6px;height:6px;border-radius:50%;background:var(--press-purple);border:1px solid #fff;}
+  .cal-dot{position:absolute;bottom:13px;left:4px;width:6px;height:6px;border-radius:50%;background:var(--press-purple);border:1px solid #fff;}
+  .cal-delta-badge{position:absolute;top:2px;right:2px;display:flex;align-items:center;gap:1px;background:rgba(255,255,255,0.9);border-radius:4px;padding:1px 3px;font-size:9.5px;font-weight:700;line-height:1.3;}
+  .cal-delta-badge svg{width:8px;height:8px;flex-shrink:0;}
   .cal-ratio-bar{position:absolute;bottom:3px;left:4px;right:4px;height:7px;border-radius:3px;overflow:hidden;display:flex;background:#C9BFA4;border:1px solid rgba(255,255,255,0.85);}
   .cal-badge{position:absolute;top:2px;left:3px;width:11px;height:11px;color:inherit;opacity:0.75;}
   .legend-row{display:flex;align-items:center;gap:8px;margin-top:12px;font-size:10.5px;color:var(--ink-faint);}
@@ -207,10 +211,10 @@
       <div class="updated-tag" id="tag-summary">no data yet</div>
     </div>
     <div class="summary-grid">
-      <div class="summary-card"><div class="label">Tickets issued</div><div class="value" id="kpi-issued">&mdash;</div></div>
-      <div class="summary-card"><div class="label">Tickets sold</div><div class="value" id="kpi-sold">&mdash;</div></div>
-      <div class="summary-card"><div class="label">Tickets comped</div><div class="value" id="kpi-comped">&mdash;</div></div>
-      <div class="summary-card"><div class="label">Box office value</div><div class="value" id="kpi-value">&mdash;</div></div>
+      <div class="summary-card"><div class="label">Tickets issued</div><div class="value-row"><div class="value" id="kpi-issued">&mdash;</div><div id="kpi-issued-delta"></div></div></div>
+      <div class="summary-card"><div class="label">Tickets sold</div><div class="value-row"><div class="value" id="kpi-sold">&mdash;</div><div id="kpi-sold-delta"></div></div></div>
+      <div class="summary-card"><div class="label">Tickets comped</div><div class="value-row"><div class="value" id="kpi-comped">&mdash;</div><div id="kpi-comped-delta"></div></div></div>
+      <div class="summary-card"><div class="label">Box office take</div><div class="value-row"><div class="value" id="kpi-value">&mdash;</div><div id="kpi-value-delta"></div></div></div>
       <div class="summary-card"><div class="label">% capacity filled</div><div class="value" id="kpi-pct">&mdash;</div></div>
       <div class="summary-card"><div class="label">Nights remaining</div><div class="value" id="kpi-remaining">&mdash;</div></div>
     </div>
@@ -295,6 +299,12 @@
     </details>
   </div>
 
+  <details id="diagnosticsPanel" style="margin-top:10px;">
+    <summary style="cursor:pointer;font-size:10.5px;color:var(--ink-faint);">Upload diagnostics</summary>
+    <div id="diagnosticsContent" style="font-size:10.5px;color:var(--ink-faint);margin-top:6px;line-height:1.6;"></div>
+  </details>
+  <div style="font-size:9.5px;color:var(--ink-faint);text-align:center;margin-top:6px;opacity:0.7;" id="buildStamp"></div>
+
 </div>
 
 <script type="module">
@@ -314,6 +324,7 @@ const db = getFirestore(fbApp);
 const stateDocRef = doc(db, 'dashboards', 'fringe2026');
 
 /* ============================= STATE ============================= */
+const DASHBOARD_BUILD = '2026-07-07 11:35';
 let state = {
   performances: {},   // 'YYYY-MM-DD': {capacity, issued, sold, comps, tag, time}
   comps: {},          // 'YYYY-MM-DD': {categoryName: {limit, sold, remaining}}
@@ -321,7 +332,11 @@ let state = {
   postcodes: [],       // [{postcode, customers}]
   postcodeTotalFromReport: null,
   events: [],          // [{date:'YYYY-MM-DD', label}] manually marked milestones
-  meta: { fullSales: null, concessionLimit: null, txSales: null, postcode: null }
+  meta: { fullSales: null, concessionLimit: null, txSales: null, postcode: null },
+  previous: {          // snapshot of each report's data + timestamp, captured right before the most recent upload of that report type
+    fullSales: null, txSales: null, concessionLimit: null, postcode: null
+  },
+  diagnostics: { lastNotes: [], lastWarnings: [] }
 };
 let heatScale = 'absolute';
 
@@ -398,20 +413,37 @@ function detectReportType(text) {
 
 function parseFullSales(text) {
   const flat = text.replace(/\s+/g, ' ');
-  const re = /(\d{2})\/(\d{2})\/(\d{4}),\s*(\d{2}:\d{2})\D*?(\d+)\s+(\d+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s*(PREVIEW|2 for 1)?/g;
+  // Assembly's Full Sales export has appeared in at least two real layouts:
+  //  - detailed: Capacity, Issued, TotalValue, FullPriceValue, ConcessionValue, FullPriceQty, ConcessionQty, Comps, Sold, TaxValue, WCCA
+  //  - simple:   Capacity, Issued, Sold, WCCA, TaxValue (comps derived as issued - sold)
+  // Detected by whether the header mentions "Full Price"/"Concession" columns.
+  const hasDetailedColumns = /Full Price/i.test(flat) && /Concession/i.test(flat);
+  // "2 for 1" contains a digit, so a plain \D*? skip stops on it; this skip pattern
+  // explicitly allows passing over that literal phrase as well as ordinary non-digit text.
+  const SKIP = '(?:2 for 1|[^\\d])*?';
   const out = {};
-  let m;
-  while ((m = re.exec(flat)) !== null) {
-    const [, dd, mm, yyyy, time, capacity, issued, totalValue, , , , , comps, sold, tag] = m;
-    const dateKey = `${yyyy}-${mm}-${dd}`;
-    out[dateKey] = {
-      time, tag: tag || null,
-      capacity: Number(capacity),
-      issued: Number(issued),
-      totalValue: Number(totalValue),
-      comps: Number(comps),
-      sold: Number(sold)
-    };
+  if (hasDetailedColumns) {
+    const re = new RegExp(`(\\d{2})\\/(\\d{2})\\/(\\d{4}),\\s*(\\d{2}:\\d{2})\\s*(PREVIEW|2 for 1)?${SKIP}(\\d+)\\s+(\\d+)\\s+([\\d.]+)\\s+([\\d.]+)\\s+([\\d.]+)\\s+(\\d+)\\s+(\\d+)\\s+(\\d+)\\s+(\\d+)\\s*(PREVIEW|2 for 1)?`, 'g');
+    let m;
+    while ((m = re.exec(flat)) !== null) {
+      const [, dd, mm, yyyy, time, tag1, capacity, issued, totalValue, , , , , comps, sold, tag2] = m;
+      out[`${yyyy}-${mm}-${dd}`] = {
+        time, tag: tag1 || tag2 || null,
+        capacity: Number(capacity), issued: Number(issued),
+        totalValue: Number(totalValue), comps: Number(comps), sold: Number(sold)
+      };
+    }
+  } else {
+    const re = new RegExp(`(\\d{2})\\/(\\d{2})\\/(\\d{4}),\\s*(\\d{2}:\\d{2})\\s*(PREVIEW|2 for 1)?${SKIP}(\\d+)\\s+(\\d+)\\s+(\\d+)\\s+(\\d+)\\s+([\\d.]+)\\s*(PREVIEW|2 for 1)?`, 'g');
+    let m;
+    while ((m = re.exec(flat)) !== null) {
+      const [, dd, mm, yyyy, time, tag1, capacity, issued, sold, wcca, taxValue, tag2] = m;
+      out[`${yyyy}-${mm}-${dd}`] = {
+        time, tag: tag1 || tag2 || null,
+        capacity: Number(capacity), issued: Number(issued),
+        totalValue: null, comps: Number(issued) - Number(sold), sold: Number(sold)
+      };
+    }
   }
   return out;
 }
@@ -426,13 +458,32 @@ function parseTxSales(text) {
     const start = dm.index + dm[0].length;
     const end = i + 1 < dateMatches.length ? dateMatches[i + 1].index : flat.length;
     const block = flat.slice(start, end);
-    const nums = (block.match(/[\d.]+/g) || []).map(Number);
-    if (nums.length < 5) continue;
-    const comps = nums[0], local = nums[1], value = nums[2], pct = nums[3];
-    const totalQty = nums[nums.length - 1];
-    const remote = totalQty - comps - local;
+    const tokens = block.match(/[\d.]+/g) || [];
+    if (tokens.length < 6) continue;
+    // This report has appeared in (at least) two real column layouts. Distinguish by counting
+    // how many plain integers (no decimal point) appear before the first decimal-formatted token:
+    //   4 leading integers -> [local, comps, remote, totalQty, value, pct, ...]
+    //   2 leading integers -> [comps, local, value, pct, then 8 more cumulative-section numbers,
+    //                          with totalQtyDaily always the 12th token overall]
+    // For the very last date in a document, the block runs to end-of-text and can sweep up
+    // trailing G.Total/footer/footnote content (including stray "." tokens from sentence endings) —
+    // reading a FIXED position rather than "the last token" avoids that contamination entirely.
+    let leadingInts = 0;
+    while (leadingInts < tokens.length && !tokens[leadingInts].includes('.')) leadingInts++;
+    let row;
+    if (leadingInts >= 4) {
+      const [local, comps, remote, totalQty, value, pct] = tokens.slice(0, 6).map(Number);
+      row = { local, comps, remote, totalQty, value, pct };
+    } else {
+      const comps = Number(tokens[0]), local = Number(tokens[1]);
+      const value = Number(tokens[2]), pct = Number(tokens[3]);
+      const totalQty = Number(tokens.length >= 12 ? tokens[11] : tokens[tokens.length - 1]);
+      const remote = totalQty - comps - local;
+      row = { local, comps, remote, totalQty, value, pct };
+    }
     const [, dd, mm, yy] = dm;
-    rows.push({ date: `${2000 + Number(yy)}-${mm}-${dd}`, local, comps, remote, totalQty, value, pct });
+    row.date = `${2000 + Number(yy)}-${mm}-${dd}`;
+    rows.push(row);
   }
   return rows;
 }
@@ -472,6 +523,25 @@ function parsePostcodes(text) {
   const totalMatch = flat.match(/(\d+)\s*Event Total/i);
   const eventTotal = totalMatch ? Number(totalMatch[1]) : null;
   return { rows, eventTotal };
+}
+
+/* Every report we parse prints its own grand total somewhere. Cross-checking our computed
+   sums against that printed total catches a future column-layout change immediately,
+   rather than needing a live debugging session to discover it — same failure mode that
+   cost real time earlier with both this report and the Full Sales one. */
+function extractFullSalesGrandTotal(text) {
+  const flat = text.replace(/\s+/g, ' ');
+  const m = flat.match(/\bTotal\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+([\d.]+)/);
+  if (!m) return null;
+  const [, capacity, issued, sold] = m;
+  return { capacity: Number(capacity), issued: Number(issued), sold: Number(sold) };
+}
+function extractTxSalesGrandTotal(text) {
+  const flat = text.replace(/\s+/g, ' ');
+  const m = flat.match(/G\.Total\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+([\d.]+)/);
+  if (!m) return null;
+  const [, local, comps, remote, totalQty, value] = m;
+  return { local: Number(local), comps: Number(comps), remote: Number(remote), totalQty: Number(totalQty), value: Number(value) };
 }
 
 /* comp categories that represent real VIP/press/industry comps (not discount concessions) */
@@ -536,6 +606,7 @@ submitBtn.addEventListener('click', async () => {
   const total = pendingFiles.length;
   const now = new Date().toISOString();
   const notes = [];
+  const warnings = [];
   for (let i = 0; i < pendingFiles.length; i++) {
     const file = pendingFiles[i];
     uploadStatus.textContent = `Reading file ${i + 1} of ${total}: ${file.name}...`;
@@ -543,23 +614,52 @@ submitBtn.addEventListener('click', async () => {
       const text = await extractPdfText(file);
       const type = detectReportType(text);
       if (type === 'fullSales') {
+        if (state.meta.fullSales) {
+          state.previous.fullSales = { performances: state.performances, timestamp: state.meta.fullSales };
+        }
         state.performances = parseFullSales(text);
         state.meta.fullSales = now;
         const n = Object.keys(state.performances).length;
         notes.push(file.name + ': read as Full Sales (' + n + ' dates)');
         if (n === 0) console.warn('Full Sales parsed 0 dates. Text snippet:', JSON.stringify(text.slice(0, 800)));
+        const grandTotal = extractFullSalesGrandTotal(text);
+        if (grandTotal) {
+          const compIssued = Object.values(state.performances).reduce((s, p) => s + p.issued, 0);
+          const compSold = Object.values(state.performances).reduce((s, p) => s + p.sold, 0);
+          if (compIssued !== grandTotal.issued || compSold !== grandTotal.sold) {
+            warnings.push(`Full Sales: parsed totals (issued ${compIssued}, sold ${compSold}) don't match this report's own printed total (issued ${grandTotal.issued}, sold ${grandTotal.sold}) — the column layout may have changed again.`);
+          }
+        }
       } else if (type === 'txSales') {
+        if (state.meta.txSales) {
+          state.previous.txSales = { txSales: state.txSales, timestamp: state.meta.txSales };
+        }
         state.txSales = parseTxSales(text);
         state.meta.txSales = now;
         notes.push(file.name + ': read as Ticket Sales Per Day (' + state.txSales.length + ' rows)');
         if (state.txSales.length === 0) console.warn('Ticket Sales Per Day parsed 0 rows. Text snippet:', JSON.stringify(text.slice(0, 800)));
+        const grandTotal = extractTxSalesGrandTotal(text);
+        if (grandTotal) {
+          const compComps = state.txSales.reduce((s, r) => s + r.comps, 0);
+          const compRemote = state.txSales.reduce((s, r) => s + r.remote, 0);
+          const compValue = state.txSales.reduce((s, r) => s + r.value, 0);
+          if (compComps !== grandTotal.comps || compRemote !== grandTotal.remote || Math.abs(compValue - grandTotal.value) > 0.01) {
+            warnings.push(`Ticket Sales Per Day: parsed totals (comps ${compComps}, remote ${compRemote}, value £${compValue.toFixed(2)}) don't match this report's own printed total (comps ${grandTotal.comps}, remote ${grandTotal.remote}, value £${grandTotal.value.toFixed(2)}) — the column layout may have changed again.`);
+          }
+        }
       } else if (type === 'concessionLimit') {
+        if (state.meta.concessionLimit) {
+          state.previous.concessionLimit = { comps: state.comps, timestamp: state.meta.concessionLimit };
+        }
         state.comps = parseConcessionLimit(text);
         state.meta.concessionLimit = now;
         const n = Object.keys(state.comps).length;
         notes.push(file.name + ': read as Concession Limit (' + n + ' dates)');
         if (n === 0) console.warn('Concession Limit parsed 0 dates. Text snippet:', JSON.stringify(text.slice(0, 800)));
       } else if (type === 'postcode') {
+        if (state.meta.postcode) {
+          state.previous.postcode = { postcodes: state.postcodes, postcodeTotalFromReport: state.postcodeTotalFromReport, timestamp: state.meta.postcode };
+        }
         const { rows, eventTotal } = parsePostcodes(text);
         state.postcodes = rows;
         state.postcodeTotalFromReport = eventTotal;
@@ -577,6 +677,7 @@ submitBtn.addEventListener('click', async () => {
     }
     uploadStatus.textContent = notes.join(' · ');
   }
+  state.diagnostics = { lastNotes: notes, lastWarnings: warnings };
   try {
     await saveState();
   } catch (e) {
@@ -591,6 +692,15 @@ submitBtn.addEventListener('click', async () => {
 });
 
 /* ============================ RENDER: SUMMARY ============================= */
+function deltaBadgeHTML(delta, prefix) {
+  if (delta === null || delta === undefined || delta === 0) return '';
+  const sign = delta > 0 ? '+' : '';
+  const style = delta > 0
+    ? 'background:#E1F0EA;color:#0B5745;'
+    : 'background:#F1EFE8;color:#5F5E5A;';
+  return `<span style="display:inline-block;${style}font-size:11px;font-weight:600;padding:2px 8px;border-radius:10px;">${sign}${prefix || ''}${delta}</span>`;
+}
+
 function renderSummary() {
   document.getElementById('tag-summary').textContent = fmtTag(state.meta.fullSales);
   const perfs = Object.values(state.performances);
@@ -607,6 +717,33 @@ function renderSummary() {
   document.getElementById('kpi-value').textContent = state.txSales.length ? '£' + value.toFixed(0) : '—';
   document.getElementById('kpi-pct').textContent = capacity ? ((issued / capacity) * 100).toFixed(1) + '%' : '—';
   document.getElementById('kpi-remaining').textContent = perfs.length ? remaining : '—';
+
+  const prevFS = state.previous.fullSales;
+  const prevTx = state.previous.txSales;
+  let issuedDelta = null, soldDelta = null, compedDelta = null, valueDelta = null;
+  if (prevFS) {
+    const prevPerfs = Object.values(prevFS.performances);
+    issuedDelta = issued - prevPerfs.reduce((s, p) => s + p.issued, 0);
+    soldDelta = sold - prevPerfs.reduce((s, p) => s + p.sold, 0);
+    compedDelta = comped - prevPerfs.reduce((s, p) => s + p.comps, 0);
+  }
+  if (prevTx) {
+    valueDelta = value - prevTx.txSales.reduce((s, r) => s + r.value, 0);
+  }
+  document.getElementById('kpi-issued-delta').innerHTML = deltaBadgeHTML(issuedDelta);
+  document.getElementById('kpi-sold-delta').innerHTML = deltaBadgeHTML(soldDelta);
+  document.getElementById('kpi-comped-delta').innerHTML = deltaBadgeHTML(compedDelta);
+  document.getElementById('kpi-value-delta').innerHTML = deltaBadgeHTML(valueDelta, '£');
+
+  const fsTag = document.getElementById('tag-summary');
+  if (prevFS || prevTx) {
+    const parts = [];
+    if (prevFS) parts.push('Full Sales prev: ' + fmtTag(prevFS.timestamp).replace('updated ', ''));
+    if (prevTx) parts.push('Ticket Sales prev: ' + fmtTag(prevTx.timestamp).replace('updated ', ''));
+    fsTag.title = parts.join(' · ');
+    fsTag.style.textDecoration = 'underline dotted';
+    fsTag.style.cursor = 'help';
+  }
 }
 
 /* ============================ RENDER: HEATMAP ============================= */
@@ -636,6 +773,19 @@ function renderHeatmap() {
     return '';
   }
   function dLabel(d) { return d.getDate() + '-' + d.toLocaleDateString('en-GB', { month: 'short' }); }
+  function issuedDeltaFor(key) {
+    const prevFS = state.previous.fullSales;
+    if (!prevFS || !prevFS.performances[key]) return null;
+    return state.performances[key].issued - prevFS.performances[key].issued;
+  }
+  const ICON_ARROW_UP = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="M12 5l0 14M18 11l-6 -6M6 11l6 -6"/></svg>';
+  const ICON_ARROW_DOWN = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="M12 19l0 -14M18 13l-6 6M6 13l6 6"/></svg>';
+  function deltaBadgeCorner(delta) {
+    if (delta === null || delta === 0) return '';
+    const color = delta > 0 ? '#0B5745' : '#5F5E5A';
+    const icon = delta > 0 ? ICON_ARROW_UP : ICON_ARROW_DOWN;
+    return `<span class="cal-delta-badge" style="color:${color};">${icon}${Math.abs(delta)}</span>`;
+  }
   const cur = new Date(gridStart);
   while (cur <= gridEnd) {
     const key = cur.toISOString().slice(0, 10);
@@ -655,12 +805,13 @@ function renderHeatmap() {
     const bg = perf.issued === 0 ? null : colorForT(t);
     const textCol = t > 0.55 ? '#fff' : '#0C447C';
     const hasPress = pressIssuedOn(key);
+    const delta = issuedDeltaFor(key);
     const cellClass = perf.issued === 0 ? 'cal-cell zero has-perf' : 'cal-cell has-perf';
     const style = bg ? `style="background:${bg};"` : '';
     const label = perf.issued === 0
       ? `<span class="d" style="color:var(--ink-dim);">${dateLabel}</span><span class="p" style="color:var(--ink-faint);">0%</span>`
       : `<span class="d" style="color:${textCol};">${dateLabel}</span><span class="p" style="color:${textCol};">${pct.toFixed(0)}% (${perf.issued})</span>`;
-    html += `<div class="${cellClass}" ${style} onclick="toggleExpand('${key}')">${label}${hasPress ? '<span class="cal-dot"></span>' : ''}${badgeFor(perf.tag)}${ratioBarHTML(perf)}</div>`;
+    html += `<div class="${cellClass}" ${style} onclick="toggleExpand('${key}')">${label}${hasPress ? '<span class="cal-dot"></span>' : ''}${badgeFor(perf.tag)}${deltaBadgeCorner(delta)}${ratioBarHTML(perf)}</div>`;
     cur.setDate(cur.getDate() + 1);
   }
   grid.innerHTML = html;
@@ -715,11 +866,19 @@ function toggleExpand(dateKey) {
     .filter(name => cats[name] && cats[name].sold > 0)
     .map(name => `<div class="row"><span>${name}</span><span>${cats[name].sold}</span></div>`)
     .join('');
+  const prevFS = state.previous.fullSales;
+  let deltaRow = '';
+  if (perf && prevFS && prevFS.performances[dateKey]) {
+    const delta = perf.issued - prevFS.performances[dateKey].issued;
+    const prevWhen = fmtTag(prevFS.timestamp).replace('updated ', '');
+    deltaRow = `<div class="row"><span>Issued since last upload (${prevWhen})</span><span>${delta > 0 ? '+' : ''}${delta}</span></div>`;
+  }
   const breakdownRows = perf ? `
     <div class="row"><span>Sold</span><span>${perf.sold}</span></div>
     <div class="row"><span>Comped</span><span>${perf.comps}</span></div>
     <div class="row"><span>Unsold</span><span>${Math.max(0, perf.capacity - perf.issued)}</span></div>
-    <div class="row"><span>Tickets issued</span><span>${perf.issued} / ${perf.capacity}</span></div>` : '';
+    <div class="row"><span>Tickets issued</span><span>${perf.issued} / ${perf.capacity}</span></div>
+    ${deltaRow}` : '';
   box.innerHTML = `<div class="title">${new Date(dateKey).toLocaleDateString('en-GB',{weekday:'short',day:'numeric',month:'short'})}</div>
     ${breakdownRows}
     ${rows || '<div class="row"><span>Industry/Press &amp; other comps</span><span>none recorded</span></div>'}`;
@@ -993,12 +1152,29 @@ function renderMap() {
   </table>`;
 }
 
+function renderDiagnostics() {
+  const box = document.getElementById('diagnosticsContent');
+  const panel = document.getElementById('diagnosticsPanel');
+  const d = state.diagnostics || { lastNotes: [], lastWarnings: [] };
+  const parts = [];
+  if (d.lastWarnings && d.lastWarnings.length) {
+    parts.push(d.lastWarnings.map(w => `<div style="color:#854F0B;margin-bottom:4px;">&#9888; ${w}</div>`).join(''));
+    panel.open = true;
+  }
+  if (d.lastNotes && d.lastNotes.length) {
+    parts.push('<div>Last upload: ' + d.lastNotes.join(' &middot; ') + '</div>');
+  }
+  box.innerHTML = parts.length ? parts.join('') : '<div>No uploads processed yet in this session.</div>';
+}
+
 /* ============================ RENDER ALL ============================= */
 function renderAll() {
   renderSummary();
   renderHeatmap();
   renderTxChart();
   renderMap();
+  renderDiagnostics();
+  document.getElementById('buildStamp').textContent = 'build ' + DASHBOARD_BUILD;
 }
 
 loadState();
